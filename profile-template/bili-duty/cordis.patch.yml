@@ -114,3 +114,7 @@
 # ── MCP 资源读取 ────────────────────────────────────────────────────────────
 - id: mcp-resources
   disabled: true
+
+# ── 视频分镜插件（放行官方 dsh-video-storyboard）───────────────────────────
+- id: dsh-video-storyboard
+  disabled: false

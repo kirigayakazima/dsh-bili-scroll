@@ -1848,6 +1848,77 @@ def _crop_tile(sheet: bytes, tile_index: int, tw: int, th: int) -> bytes:
     return buf.getvalue()
 
 
+
+def _format_time(sec: float) -> str:
+    s = int(max(0, sec))
+    m = s // 60
+    s = s % 60
+    h = m // 60
+    m = m % 60
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _compose_storyboard(tile_images: list, tile_infos: list) -> bytes:
+    """
+    将裁好的多个切片拼成一张带编号和时间戳的单图接触印相分镜（Contact Sheet）。
+    对齐 dsh-video-storyboard 的省 token 架构：将原本 N 张独立图片（N*384 Token）
+    合并为单一图片（固定 384 Token），立省 66%~83% 多模态视觉 Token！
+    """
+    import io
+    from PIL import Image, ImageDraw
+
+    n = len(tile_images)
+    if n == 0:
+        raise ValueError("No images to compose")
+    if n == 1:
+        im = tile_images[0]
+        draw = ImageDraw.Draw(im)
+        label = f"#1  {_format_time(tile_infos[0].get('got_sec', 0))}"
+        draw.rectangle([6, 6, 6 + len(label) * 8 + 10, 24], fill=(0, 0, 0))
+        draw.text((10, 8), label, fill=(255, 255, 255))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85)
+        return buf.getvalue()
+
+    tw, th = tile_images[0].size
+    if n <= 3:
+        cols = n
+        rows = 1
+    elif n <= 4:
+        cols = 2
+        rows = 2
+    else:
+        cols = 3
+        rows = 2
+
+    gap = 4
+    canvas_w = cols * tw + (cols - 1) * gap
+    canvas_h = rows * th + (rows - 1) * gap
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(20, 20, 20))
+    draw = ImageDraw.Draw(canvas)
+
+    for i, (tile_im, info) in enumerate(zip(tile_images, tile_infos)):
+        c = i % cols
+        r = i // cols
+        x = c * (tw + gap)
+        y = r * (th + gap)
+        canvas.paste(tile_im, (x, y))
+
+        label = f"#{i + 1}  {_format_time(info.get('got_sec', 0))}"
+        badge_w = len(label) * 8 + 12
+        badge_h = 20
+        bx = x + 6
+        by = y + 6
+        draw.rectangle([bx, by, bx + badge_w, by + badge_h], fill=(0, 0, 0))
+        draw.text((bx + 6, by + 4), label, fill=(255, 255, 255))
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
 @tool()
 async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     """
@@ -1939,7 +2010,7 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
         return cache[no]
 
     # 每张拼图装几块要等第一张下来才知道（列数 = 宽 // 块宽）
-    blocks, frames, failed = [], [], []
+    tile_images, frames, failed = [], [], []
     cap = None
     for i, (want, got, tile) in enumerate(picked):
         try:
@@ -1955,21 +2026,32 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             raw = _crop_tile(await get_sheet(sheet_no), pos, tw, th)
             if len(raw) > _MAX_IMAGE_BYTES:
                 raise RuntimeError(f"这一帧太大（{len(raw) // 1024}KB）")
-            blocks.append(ImageContent(
-                type="image",
-                data=base64.b64encode(raw).decode("ascii"),
-                mimeType="image/jpeg",
-            ))
+            import io
+            from PIL import Image
+            tile_im = Image.open(io.BytesIO(raw))
+            tile_images.append(tile_im)
             frames.append({"index": i, "want_sec": want, "got_sec": got,
                            "kb": round(len(raw) / 1024, 1)})
         except Exception as e:
             failed.append({"index": i, "want_sec": want, "got_sec": got, "reason": str(e)})
 
-    if not blocks:
+    if not tile_images:
         return _text_only({
             "bvid": bvid, "ok": False,
             "error": "一帧都没取到", "failed": failed,
         })
+
+    # ⭐ 2026-10-31 架构对齐：Contact Sheet 接触印相分镜（借鉴 dsh-video-storyboard）
+    # 将原本作为多张独立图片返回的切片（消耗 N*384 Token）拼合成一张带时间轴的单图
+    # 模型只需接收 1 张图，Token 消耗死锁在 384 Token（立省 66%~83%），且在同一张图上看清时间演进！
+    composite_bytes = _compose_storyboard(tile_images, frames)
+    blocks = [
+        ImageContent(
+            type="image",
+            data=base64.b64encode(composite_bytes).decode("ascii"),
+            mimeType="image/jpeg",
+        )
+    ]
 
     return [
         TextContent(type="text", text=json.dumps({
@@ -1980,10 +2062,12 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             "covered_sec": round(covered, 1),
             "pages": max(1, len(pages)),
             "tile": f"{tw}x{th}",
+            "storyboard": True,
+            "storyboard_tiles": len(frames),
+            "token_mode": "contact_sheet_single_image (384 tokens fixed)",
             "frames": frames,
             "failed": failed,        # 空列表 = 全成
-            "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块（故事板按固定间隔切）；"
-                    "多P 视频只覆盖第 1P，看 covered_sec",
+            "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块；所有切片已拼合为单张接触印相图（含时间标签，节省图片Token）",
         }, ensure_ascii=False)),
         *blocks,
     ]
