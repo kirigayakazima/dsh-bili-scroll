@@ -1273,6 +1273,8 @@ function reportMeta() {
           : '**开着、但依赖没装好** ⇒ 这一轮没字幕的视频只能跳过')
         : '关着（没字幕的视频就跳过）'}；`
       + `⭐ 不管哪种情况，**报告里都要写一行「因无字幕跳过 N 条」**（N=0 也写）—— 别让它悄悄少几条。`
+      // ⭐ 2026-10-24：值班轮禁用系统工具，向提示词注入当前时钟
+      + `现在是 ${new Date().toLocaleString('zh-CN', { hour12: false })}（本机时间）—— 写时间戳用它，别猜、也别说读不到。`
       + `判重表 = ${join(stateDir, 'seen.md')}（**就是这个绝对路径**，别写到家目录 ~、也别写到别处）；`
       + `⚠️ 它读不出来或写不进去，**必须在报告里明说** —— 那一轮宁可不发评论，也别当成"没有记录"重发一遍。`
       + `⭐ 另外把这一轮**看过的每一条视频（挑中的和跳过的都算）**追加进归档：${join(digestDir, `${dayKey().slice(0, 7)}.md`)}`
@@ -1544,6 +1546,8 @@ function reportMeta() {
         '          - ' + yq(posix(script)),
         '        env:',
         '          BILI_MCP_TOOLS: ' + yq(mcpWhitelist().join(',')),
+        // ⭐ 2026-10-24 安全加固：下发私信收件人白名单 UID 到 MCP 进程
+        ...(dmOwnerUid() ? ['          BILI_DUTY_DM_UID: ' + yq(String(dmOwnerUid()))] : []),
         '',
       )
     }
@@ -1805,6 +1809,23 @@ function reportMeta() {
     }
     // ⭐ 跨宿主运行锁：拿到才跑（写不了锁时照常跑，函数内部已经 fail-open）
     if (!acquireRunLock(why)) return { started: false, why, busy: true, error: '另一个宿主正在跑这一轮' }
+
+    // ⭐ Heart Protocol v1 联动评估：检查当前是否处于安静时段或疲惫状态
+    if (ctx && ctx.heart && typeof ctx.heart.evaluateActivity === 'function') {
+      try {
+        const evalRes = ctx.heart.evaluateActivity({
+          activity: 'bili_duty',
+          intent: 'browse_daily_updates',
+          reason: why,
+        })
+        if (evalRes && evalRes.allowed === false) {
+          log(`Heart 评估当前不宜执行刷B站活动 (${evalRes.reason || 'denied'})，本轮跳过`)
+          return { started: false, why, error: `Heart 状态限制：${evalRes.reason || '未被允许'}` }
+        }
+      } catch (err) {
+        // 评估异常不阻断核心运行
+      }
+    }
     const overlay = ensureOverlay()
       const args = [...dsh.args, '--profile', effectiveProfile()]
     if (overlay) args.push('--patch', overlay)
@@ -1877,6 +1898,25 @@ function reportMeta() {
       } catch { /* 忽略 */ }
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
       try { writeRoundNotesToReport() } catch { /* 写不进去也不能炸 */ }
+
+      // ⭐ Heart Protocol v1 感知上报：完成 B站 巡检后向 Heart 记录状态与挑中数量
+      if (ctx && ctx.heart && typeof ctx.heart.observe === 'function') {
+        try {
+          const picked = countPickedToday()
+          ctx.heart.observe({
+            type: 'bili_duty_done',
+            source: 'bili-scroll',
+            confidence: 1.0,
+            evidence: {
+              why,
+              code,
+              picked,
+              day: dayKey(),
+            },
+            summary: `完成了 B站 日报巡检（挑中 ${picked} 条，退出码 ${code}）`,
+          }).catch(() => {})
+        } catch {}
+      }
     // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
     if (code === 0 && Number(cfg.favFolderId) > 0) {
       favToday('auto').catch((error) => log('自动收藏出错（已兜住）：' + String(error?.message ?? error)))
@@ -3392,6 +3432,19 @@ function reportMeta() {
   } catch (e) { log(`HTTP 路由没挂上：${e?.message ?? e}`) }
 
   ctx.effect(() => () => { try { mcp?.stop() } catch { /* 收摊 */ } }, 'bili-duty: 收 MCP 子进程')
+
+  // ⭐ 监听 Heart 闲时事件（heart/idle）
+  if (ctx && typeof ctx.on === 'function') {
+    ctx.on('heart/idle', (event) => {
+      try {
+        refreshCfg()
+        if (cfg.idleTrigger === true && event?.category === 'browse') {
+          log('收到 Heart 闲时事件 (browse)，触发轻量巡检')
+          runDuty('heart_idle')
+        }
+      } catch {}
+    })
+  }
   try { ensureDutyProfile() } catch { /* 上面已记日志 */ }
   if (dutyProfileState === 'ok') log('值班轮用最小权限 profile：bili-duty（无文件系统 / 无命令 / 无联网）')
   else log('⚠️ 最小权限 profile 不可用（' + dutyProfileState + '）⇒ 值班轮仍用 headless（这一轮能力偏大）')
