@@ -12,11 +12,12 @@ test('bili-scroll 基础插件元数据完整', () => {
 
 test('Heart Protocol v1 评估与上报契约字段校验', () => {
   const evaluatePayload = {
-    activity: 'bili_duty',
     intent: 'browse_daily_updates',
-    reason: 'window',
+    category: 'bilibili',
+    estimatedDurationMinutes: 15,
   }
-  assert.equal(evaluatePayload.activity, 'bili_duty')
+  assert.equal(evaluatePayload.intent, 'browse_daily_updates')
+  assert.equal(evaluatePayload.category, 'bilibili')
 
   const observePayload = {
     type: 'bili_duty_done',

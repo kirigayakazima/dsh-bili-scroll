@@ -1811,14 +1811,16 @@ function reportMeta() {
     if (!acquireRunLock(why)) return { started: false, why, busy: true, error: '另一个宿主正在跑这一轮' }
 
     // ⭐ Heart Protocol v1 联动评估：检查当前是否处于安静时段或疲惫状态
-    if (ctx && ctx.heart && typeof ctx.heart.evaluateActivity === 'function') {
+    let heart = null
+    try { heart = ctx?.heart } catch {}
+    if (heart && typeof heart.evaluateActivity === 'function') {
       try {
-        const evalRes = ctx.heart.evaluateActivity({
-          activity: 'bili_duty',
+        const evalRes = heart.evaluateActivity({
           intent: 'browse_daily_updates',
-          reason: why,
+          category: 'bilibili',
+          estimatedDurationMinutes: 15,
         })
-        if (evalRes && evalRes.allowed === false) {
+        if (evalRes && evalRes.suitable === false) {
           log(`Heart 评估当前不宜执行刷B站活动 (${evalRes.reason || 'denied'})，本轮跳过`)
           return { started: false, why, error: `Heart 状态限制：${evalRes.reason || '未被允许'}` }
         }
