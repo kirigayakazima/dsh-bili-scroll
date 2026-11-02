@@ -35,6 +35,7 @@ import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.
 import { resolveUid } from './lib/uid.mjs'
 import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
+import { getOptionalService, guardCallback, observeHeart } from './lib/lifecycle.mjs'
 
 export const name = 'bili-scroll'
 // attachments / llm 故意**不**列进 inject：它们只在看图时才用 ctx.get 取，
@@ -1811,8 +1812,7 @@ function reportMeta() {
     if (!acquireRunLock(why)) return { started: false, why, busy: true, error: '另一个宿主正在跑这一轮' }
 
     // ⭐ Heart Protocol v1 联动评估：检查当前是否处于安静时段或疲惫状态
-    let heart = null
-    try { heart = ctx?.heart } catch {}
+    const heart = getOptionalService(ctx, 'heart')
     if (heart && typeof heart.evaluateActivity === 'function') {
       try {
         const evalRes = heart.evaluateActivity({
@@ -1821,6 +1821,7 @@ function reportMeta() {
           estimatedDurationMinutes: 15,
         })
         if (evalRes && evalRes.suitable === false) {
+          releaseRunLock()
           log(`Heart 评估当前不宜执行刷B站活动 (${evalRes.reason || 'denied'})，本轮跳过`)
           return { started: false, why, error: `Heart 状态限制：${evalRes.reason || '未被允许'}` }
         }
@@ -1843,6 +1844,7 @@ function reportMeta() {
         const last = Number(st0.lastManualAt || 0)
         const cd = Math.max(0, Number(cfg.manualCooldownMin) || 0) * 60_000
         if (last && cd > 0 && Date.now() - last < cd) {
+          releaseRunLock()
           const wait = Math.ceil((cd - (Date.now() - last)) / 60_000)
           log(`手动轮刚跑过（${Math.round((Date.now() - last) / 60_000)} 分钟前）⇒ 再等 ${wait} 分钟`)
           return { ok: false, started: false, error: `手动轮刚跑过，再等 ${wait} 分钟（防手滑狂点）` }
@@ -1888,24 +1890,24 @@ function reportMeta() {
     dutyStartedAt = Date.now()
     dutyWatchdog = setTimeout(() => killDuty(`超过 ${dutyTimeoutMin()} 分钟没跑完`), dutyTimeoutMin() * 60_000)
     dutyWatchdog.unref?.()
-    child.on('exit', (code) => {
+    child.on('exit', guardCallback((code) => {
       releaseRunLock()            // ⭐ 这一轮结束了，把锁放开（删不掉也没事，10 分钟自动过期）
       const startedAt = dutyStartedAt
       if (dutyChild === child) dutyClear()
       log(`刷B站结束（${why}，code=${code}）`)
       // ⭐ 2026-10-25：这一轮刚生成的会话，稍等它落盘后归档 —— 别让它占着侧栏「未分组」
       try {
-        const t = setTimeout(() => { archiveDutyBucket(startedAt - 5000) }, 1200)
+        const t = setTimeout(guardCallback(() => { archiveDutyBucket(startedAt - 5000) }, error => log('巡检归档失败：' + String(error?.message ?? error))), 1200)
         t.unref?.()
       } catch { /* 忽略 */ }
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
       try { writeRoundNotesToReport() } catch { /* 写不进去也不能炸 */ }
 
       // ⭐ Heart Protocol v1 感知上报：完成 B站 巡检后向 Heart 记录状态与挑中数量
-      if (ctx && ctx.heart && typeof ctx.heart.observe === 'function') {
+      {
         try {
           const picked = countPickedToday()
-          ctx.heart.observe({
+          observeHeart(ctx, {
             type: 'bili_duty_done',
             source: 'bili-scroll',
             confidence: 1.0,
@@ -1916,8 +1918,8 @@ function reportMeta() {
               day: dayKey(),
             },
             summary: `完成了 B站 日报巡检（挑中 ${picked} 条，退出码 ${code}）`,
-          }).catch(() => {})
-        } catch {}
+          }, error => log('Heart 经验回流失败（不影响宿主）：' + String(error?.message ?? error)))
+        } catch (error) { log('Heart 巡检结果整理失败：' + String(error?.message ?? error)) }
       }
     // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
     if (code === 0 && Number(cfg.favFolderId) > 0) {
@@ -1943,17 +1945,18 @@ function reportMeta() {
       // ⭐ 发完评论之后**过一会儿再核一次**（2026-10-16 加的「评论发出后复核」）：
       //    接口回"发送成功"≠ 公开可见（新号/风控会进审核）；而"不公开"时连 @ 通知都不会推 ⇒
       //    插件会以为发了、下一轮不再发 ⇒ 一条都没到人。等 90 秒再查，避免把"还在审核"误判成"没发出去"。
-      const verifyTimer = setTimeout(() => { Promise.resolve(runVerify('round')).catch((e) => log('复核异常：' + (e?.message ?? e))) }, 90_000)
+      const verifyTimer = setTimeout(guardCallback(() => runVerify('round'), error => log('复核异常：' + String(error?.message ?? error))), 90_000)
       verifyTimer.unref?.()   // 别为了一次复核把宿主进程的退出拖住 90 秒
-    })
-    child.on('close', () => { if (dutyChild === child) dutyChild = null })
-    child.on('error', (e) => {
+    }, error => log('巡检退出回调失败（不影响宿主）：' + String(error?.message ?? error))))
+    child.on('close', guardCallback(() => { if (dutyChild === child) dutyClear() }, error => log('巡检清理失败：' + String(error?.message ?? error))))
+    child.on('error', guardCallback((e) => {
       releaseRunLock()
       if (dutyChild === child) dutyClear()
       log(`刷B站起不来：${e?.message ?? e}`)
-    })
+    }, error => log('巡检启动失败回调异常：' + String(error?.message ?? error))))
     return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile }
    } catch (e) {
+    if (!dutyChild) releaseRunLock()
     log(`刷B站开跑失败（${why}）：${e?.stack ?? e}`)
     return { started: false, why, error: String(e?.message ?? e) }
    }
@@ -2122,7 +2125,11 @@ function reportMeta() {
       const pick = (buf) => { try { appendFileSync(logFile, toText(buf), 'utf8') } catch { /* 丢日志也不能抛 */ } }
       child.stdout?.on('data', pick)
       child.stderr?.on('data', pick)
-      child.on('exit', (code) => {
+      child.on('error', guardCallback(error => {
+        dmReplyRunning = false
+        log('私信子进程启动失败：' + String(error?.message ?? error))
+      }, error => log('私信错误回调异常：' + String(error?.message ?? error))))
+      child.on('exit', guardCallback((code) => {
         dmReplyRunning = false
         log(`私信回复结束（code=${code}）`)
         rotateLogIfBig()
@@ -2138,7 +2145,7 @@ function reportMeta() {
           log('⚠️ 续会话失败（' + savedSid.slice(0, 16) + '…）⇒ 清掉 id，立刻用新会话重试一次（这条不能没回）')
           setTimeout(() => { try { runDmReply(fromUid, text) } catch { /* 兜住 */ } }, 800)
         }
-      })
+      }, error => log('私信退出回调失败（不影响宿主）：' + String(error?.message ?? error))))
       return { ok: true }
     } catch (e) { log('私信回复出错：' + String(e?.message ?? e)); return { ok: false } }
   }
