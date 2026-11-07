@@ -1,6 +1,6 @@
 {
   "name": "dsh-bili-scroll",
-  "version": "2.4.0-heart.2",
+  "version": "2.4.0-heart.3",
   "description": "DSH 插件：每天替你刷一轮 B站 —— 读字幕挑出值得的、写一份日报，值得的就 @ 你",
   "keywords": [
     "dsh",
@@ -52,9 +52,6 @@
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/schemastery": "*"
-  },
-  "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-tools": {

@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url'
 import { McpClient } from './lib/mcp.mjs'
 import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, seenDay } from './lib/state.mjs'
+import { WatchCompanion, TextRiddle } from './lib/watch_companion.js'
 import { diagnoseRound } from './lib/diagnose.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
@@ -574,10 +575,9 @@ function reportMeta() {
    * 工具返回值一律过一遍这里：**宿主只吃"无损 JSON"**，塞进去任何函数/循环引用/类实例都会报
    * `value is not lossless JSON`（2026-10-14 第一次挂上就撞了一次）。
    */
-  const safe = (v) => {
-    if (v === undefined || v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return v
-    try { return JSON.parse(JSON.stringify(v)) } catch { return String(v) }
-  }
+  const safe = (v) => JSON.parse(JSON.stringify(v ?? null))
+  const watch = new WatchCompanion(join(stateDir, 'watch-companion.json'))
+  const riddles = new TextRiddle()
 
   const tool = (spec) => ctx.tools.register(defineTool({
     ...spec,
@@ -621,7 +621,64 @@ function reportMeta() {
     description: '取一个视频的字幕（AI 字幕）全文。**判断内容就靠它** —— 没有字幕时，'
       + '若设置里开了「本地转写」再想别的办法，否则直接跳过这条。',
     parameters: { bvid: { type: 'string', description: 'BV号' } },
-    async execute(args) { return call('bili_subtitle', { bvid: String(args.bvid ?? '') }) },
+    async execute(args, exec) {
+      const bvid = String(args.bvid ?? '')
+      const cutoff = watch.cutoff(bvid)
+      const result = await call('bili_subtitle', { bvid, ...(cutoff !== null && { watched_until: cutoff }) }, { signal: exec?.signal })
+      const latest = watch.cutoff(bvid)
+      if ((cutoff !== null && result?.watched_until !== cutoff) || (latest !== null && (cutoff === null || cutoff > latest))) {
+        return { ok: false, reason: 'bounded_subtitles_unavailable' }
+      }
+      return result
+    },
+  })
+
+  tool({
+    name: 'bili_watch_companion',
+    description: '共同陪看 B 站首 P。start 开始，checkpoint 记录用户已实际看到的秒数，pause/resume/stop 控制活动。字幕及分镜自动限制在检查点以内。',
+    parameters: {
+      bvid: { type: 'string', required: true },
+      action: { type: 'string', required: true, enum: ['start', 'status', 'checkpoint', 'pause', 'resume', 'stop'] },
+      revision: { type: 'integer', description: '最近回执的 revision，checkpoint/pause/resume/stop 时必需' },
+      seconds: { type: 'number', description: '用户确认已看到的秒数' },
+    },
+    async execute(args, exec) {
+      exec?.signal?.throwIfAborted()
+      const heart = getOptionalService(ctx, 'heart')
+      if (['start', 'resume'].includes(args.action)) {
+        const gate = await heart?.evaluateActivity?.({ intent: 'watch_companion', category: 'entertainment' }, { execution: exec })
+        if (gate?.suitable === false) return { ok: false, reason: gate.reason }
+      }
+      exec?.signal?.throwIfAborted()
+      const result = watch.change(args)
+      if (result.ok && args.action === 'checkpoint') {
+        await observeHeart(ctx, { type: 'activity', source: 'bili-scroll', confidence: 1,
+          timestamp: new Date().toISOString(), summary: '续接共同观看', evidence: { bvid: args.bvid, seconds: args.seconds } },
+        error => ctx.logger.warn(`陪看回流失败：${error.message}`))
+      }
+      return result
+    },
+  })
+
+  tool({
+    name: 'companion_riddle',
+    description: '一起玩文字海龟汤。保留回执版本号，按合法动作询问主题、取线索、提交谜底或结束。',
+    parameters: {
+      action: { type: 'string', required: true, enum: ['start', 'status', 'ask', 'hint', 'guess', 'stop'] },
+      revision: { type: 'integer' },
+      question: { type: 'string' },
+      answer: { type: 'string' },
+    },
+    async execute(args, exec) {
+      const session = exec?.agent?.id
+      if (!session || exec?.signal?.aborted) return { status: 'unavailable' }
+      if (args.action === 'start') {
+        const gate = await getOptionalService(ctx, 'heart')?.evaluateActivity?.({ intent: 'companion_riddle', category: 'entertainment' }, { execution: exec })
+        if (gate?.suitable === false) return { status: 'blocked', reason: gate.reason }
+      }
+      exec?.signal?.throwIfAborted()
+      return riddles.play(session, args)
+    },
   })
 
   tool({
@@ -723,12 +780,19 @@ function reportMeta() {
     output: imageOutput,
     async execute(args, exec) {
       const at = Array.isArray(args.at) ? args.at.map(Number).filter(Number.isFinite) : undefined
+      const bvid = String(args.bvid ?? '')
+      const cutoff = watch.cutoff(bvid)
       const { json, images } = await callRaw('bili_frames', {
-        bvid: String(args.bvid ?? ''),
+        bvid,
         num: Math.max(1, Math.min(Number(args.num) || 3, 6)),
         ...(at && at.length ? { at } : {}),
+        ...(cutoff !== null && { watched_until: cutoff }),
       }, { signal: exec?.signal })
       const meta = json && typeof json === 'object' ? json : { raw: json }
+      const latest = watch.cutoff(bvid)
+      if ((cutoff !== null && meta.watched_until !== cutoff) || (latest !== null && (cutoff === null || cutoff > latest))) {
+        return { ok: false, reason: 'bounded_frames_unavailable' }
+      }
       if (!meta.ok) return meta
       if (!images.length) return { ...meta, ok: false, error: 'MCP 没返回图片' }
 
@@ -1275,7 +1339,7 @@ function reportMeta() {
         : '关着（没字幕的视频就跳过）'}；`
       + `⭐ 不管哪种情况，**报告里都要写一行「因无字幕跳过 N 条」**（N=0 也写）—— 别让它悄悄少几条。`
       // ⭐ 2026-10-24：值班轮禁用系统工具，向提示词注入当前时钟
-      + `现在是 ${new Date().toLocaleString('zh-CN', { hour12: false })}（本机时间）—— 写时间戳用它，别猜、也别说读不到。`
+      + `现在是 ${new Date().toLocaleString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' })}（上海时间）—— 写时间戳用它，别猜、也别说读不到。`
       + `判重表 = ${join(stateDir, 'seen.md')}（**就是这个绝对路径**，别写到家目录 ~、也别写到别处）；`
       + `⚠️ 它读不出来或写不进去，**必须在报告里明说** —— 那一轮宁可不发评论，也别当成"没有记录"重发一遍。`
       + `⭐ 另外把这一轮**看过的每一条视频（挑中的和跳过的都算）**追加进归档：${join(digestDir, `${dayKey().slice(0, 7)}.md`)}`
@@ -2453,8 +2517,7 @@ function reportMeta() {
       const text = readFileSync(file, 'utf8')
       const rows = text.split(/\r?\n/)
       const cutoff = new Date(Date.now() - 30 * 86400_000)
-      const pad = (n) => String(n).padStart(2, '0')
-      const cutKey = cutoff.getFullYear() + '-' + pad(cutoff.getMonth() + 1) + '-' + pad(cutoff.getDate())
+      const cutKey = dayKey(cutoff)
       const keep = []
       const moved = new Map()   // 月份 → 行数组
       for (const raw of rows) {

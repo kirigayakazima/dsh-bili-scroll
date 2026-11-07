@@ -153,7 +153,7 @@ def _ledger_append(text: str, bvid: str, rpid=None):
         p = _ledger_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
-            f.write(f"- {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')} {bvid} rpid={rpid or 0} · {' '.join(str(text).split())}\n")
+            f.write(f"- {_dt.datetime.now(_SHANGHAI).strftime('%Y-%m-%d %H:%M')} {bvid} rpid={rpid or 0} · {' '.join(str(text).split())}\n")
     except Exception:
         pass
 
@@ -526,8 +526,16 @@ async def bili_comments(bvid: str, num: int = 30) -> str:
 
 # ========== Tool 3: 获取字幕 ==========
 
+def _watched_subtitles(items, watched_until):
+    return [
+        item for item in items
+        if isinstance(item.get("from"), (int, float)) and isinstance(item.get("to"), (int, float))
+        and 0 <= item["from"] <= item["to"] <= watched_until
+    ]
+
+
 @tool()
-async def bili_subtitle(bvid: str) -> str:
+async def bili_subtitle(bvid: str, watched_until: float | None = None) -> str:
     """
     获取B站视频的AI字幕（语音转文字）
 
@@ -574,7 +582,10 @@ async def bili_subtitle(bvid: str) -> str:
         async with session.get(sub_url) as resp:
             sub_data = await resp.json()
 
-    texts = [item.get("content", "") for item in sub_data.get("body", [])]
+    items = sub_data.get("body", [])
+    if watched_until is not None:
+        items = _watched_subtitles(items, watched_until)
+    texts = [item.get("content", "") for item in items]
     full_text = "\n".join(texts)
 
     return json.dumps({
@@ -583,6 +594,7 @@ async def bili_subtitle(bvid: str) -> str:
         "language": target.get("lan_doc", ""),
         "segments": len(texts),
         "text": full_text,
+        **({"watched_until": watched_until} if watched_until is not None else {}),
     }, ensure_ascii=False)
 
 
@@ -1311,11 +1323,14 @@ async def bili_received_at_and_likes() -> str:
 #    · 输入里的竖线会被转义，标题带 | 也不会把表格弄坏
 import datetime as _dt
 
+
+_SHANGHAI = _dt.timezone(_dt.timedelta(hours=8), 'Asia/Shanghai')
+
 DUTY_HOME = Path(os.environ.get("BILI_DUTY_HOME") or (Path.home() / ".dsh" / "bili-duty"))
 
 
 def _duty_today() -> str:
-    return _dt.datetime.now().strftime("%Y-%m-%d")
+    return _dt.datetime.now(_SHANGHAI).strftime("%Y-%m-%d")
 
 
 _DUTY_DATE_RE = re.compile(r"^(?:(\d{4})[-/.])?(\d{1,2})[-/.](\d{1,2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?$")
@@ -1324,7 +1339,7 @@ _DUTY_DATE_RE = re.compile(r"^(?:(\d{4})[-/.])?(\d{1,2})[-/.](\d{1,2})(?:[ T]\d{
 def _duty_norm_date(raw: str) -> str:
     """模型给的日期 → YYYY-MM-DD；认不出来就用今天（#133：以前 `10-23` 原样写进判重表，宿主解析不了）。
     没写年份按今年补，补出来比今天晚就算去年 —— 跟宿主 lib/state.mjs 的 seenDay 同一套规则。"""
-    today = _dt.date.today()
+    today = _dt.datetime.now(_SHANGHAI).date()
     m = _DUTY_DATE_RE.match(str(raw or "").strip())
     if not m:
         return today.isoformat()
@@ -1363,7 +1378,7 @@ def duty_paths() -> str:
         "home": str(DUTY_HOME),
         "report": str(DUTY_HOME / "out" / (_duty_today() + ".md")),
         "seen": str(DUTY_HOME / "seen.md"),
-        "digest": str(DUTY_HOME / "digest" / (_dt.datetime.now().strftime("%Y-%m") + ".md")),
+        "digest": str(DUTY_HOME / "digest" / (_dt.datetime.now(_SHANGHAI).strftime("%Y-%m") + ".md")),
     }
     return json.dumps(out, ensure_ascii=False)
 
@@ -1457,7 +1472,7 @@ def duty_digest_append(text: str) -> str:
     body = str(text or "").replace("\r\n", "\n").strip()
     if not body:
         return "没写：内容是空的"
-    p = DUTY_HOME / "digest" / (_dt.datetime.now().strftime("%Y-%m") + ".md")
+    p = DUTY_HOME / "digest" / (_dt.datetime.now(_SHANGHAI).strftime("%Y-%m") + ".md")
     return "已追加到 " + _append(p, body + "\n")
 
 
@@ -1585,8 +1600,8 @@ async def bili_transcribe(bvid: str) -> str:
     py, why, _out = _transcribe_paths(bv)
     if not py:
         return str(why)
-    job_id = "tj" + _dt.datetime.now().strftime("%H%M%S") + "-" + bv[-4:]
-    _TRANSCRIBE_JOBS[job_id] = {"state": "running", "text": "", "bvid": bv, "started": _dt.datetime.now().timestamp()}
+    job_id = "tj" + _dt.datetime.now(_SHANGHAI).strftime("%H%M%S") + "-" + bv[-4:]
+    _TRANSCRIBE_JOBS[job_id] = {"state": "running", "text": "", "bvid": bv, "started": _dt.datetime.now(_SHANGHAI).timestamp()}
     _job_prune()
     task = asyncio.create_task(_job_run(job_id, bv))
     try:
@@ -1621,8 +1636,8 @@ async def bili_transcribe_start(bvid: str) -> str:
     py, why, _out = _transcribe_paths(bv)
     if not py:
         return json.dumps({"ok": False, "error": why}, ensure_ascii=False)
-    job_id = "tj" + _dt.datetime.now().strftime("%H%M%S") + "-" + bv[-4:]
-    _TRANSCRIBE_JOBS[job_id] = {"state": "running", "text": "", "bvid": bv, "started": _dt.datetime.now().timestamp()}
+    job_id = "tj" + _dt.datetime.now(_SHANGHAI).strftime("%H%M%S") + "-" + bv[-4:]
+    _TRANSCRIBE_JOBS[job_id] = {"state": "running", "text": "", "bvid": bv, "started": _dt.datetime.now(_SHANGHAI).timestamp()}
     _job_prune()
     asyncio.create_task(_job_run(job_id, bv))
     return json.dumps({
@@ -1860,15 +1875,19 @@ def _format_time(sec: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def _watched_entries(entries, watched_until):
+    return [entry for entry in entries if 0 <= entry[0] <= watched_until]
+
+
 def _compose_storyboard(tile_images: list, tile_infos: list) -> bytes:
     """
     将裁好的多个切片拼成一张带编号和时间戳的单图接触印相分镜（Contact Sheet）。
-    对齐 dsh-video-storyboard 的省 token 架构：将原本 N 张独立图片（N*384 Token）
-    合并为单一图片（固定 384 Token），立省 66%~83% 多模态视觉 Token！
+    画布最长边限制为 768 像素，单次只提交一个附件。
     """
     import io
     from PIL import Image, ImageDraw
 
+    resampling = getattr(Image, "Resampling", Image)
     n = len(tile_images)
     if n == 0:
         raise ValueError("No images to compose")
@@ -1878,6 +1897,7 @@ def _compose_storyboard(tile_images: list, tile_infos: list) -> bytes:
         label = f"#1  {_format_time(tile_infos[0].get('got_sec', 0))}"
         draw.rectangle([6, 6, 6 + len(label) * 8 + 10, 24], fill=(0, 0, 0))
         draw.text((10, 8), label, fill=(255, 255, 255))
+        im.thumbnail((768, 768), resampling.LANCZOS)
         buf = io.BytesIO()
         im.save(buf, format="JPEG", quality=85)
         return buf.getvalue()
@@ -1915,12 +1935,13 @@ def _compose_storyboard(tile_images: list, tile_infos: list) -> bytes:
         draw.rectangle([bx, by, bx + badge_w, by + badge_h], fill=(0, 0, 0))
         draw.text((bx + 6, by + 4), label, fill=(255, 255, 255))
 
+    canvas.thumbnail((768, 768), resampling.LANCZOS)
     buf = io.BytesIO()
     canvas.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
 @tool()
-async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
+async def bili_frames(bvid: str, num: int = 3, at: list | None = None, watched_until: float | None = None) -> list:
     """
     看这个视频里的画面（从 B 站自带的故事板里裁几帧）
 
@@ -1984,6 +2005,14 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     if story_max > 0:
         covered = min(covered, story_max)
 
+    if watched_until is not None:
+        # Filter the source frames before nearest-frame selection and before compositing.
+        covered = min(covered, watched_until)
+        entries = _watched_entries(entries, covered)
+        if not entries:
+            return _text_only({"bvid": bvid, "ok": False, "watched_until": watched_until,
+                               "error": "当前观看进度内没有画面"})
+
     # 目标时间点：传了 at 就用它；否则按"覆盖长度"均分
     if at:
         targets = [min(max(0.0, float(t)), max(0.0, covered - 0.1)) for t in at][:_FRAME_MAX]
@@ -1994,7 +2023,7 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
     picked = []
     for t in targets:
         ts, tile = min(entries, key=lambda e: abs(e[0] - t))
-        picked.append((round(t, 1), round(ts, 1), tile))
+        picked.append((round(t, 1), ts if watched_until is not None else round(ts, 1), tile))
 
     tw = int(snap.get("img_x_size") or _TILE_W_DEFAULT)
     th = int(snap.get("img_y_size") or _TILE_H_DEFAULT)
@@ -2064,7 +2093,8 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
             "tile": f"{tw}x{th}",
             "storyboard": True,
             "storyboard_tiles": len(frames),
-            "token_mode": "contact_sheet_single_image (384 tokens fixed)",
+            "token_mode": "contact_sheet_single_image",
+            **({"watched_until": watched_until} if watched_until is not None else {}),
             "frames": frames,
             "failed": failed,        # 空列表 = 全成
             "note": "want_sec 是想要的时刻，got_sec 是实际取到的那一块；所有切片已拼合为单张接触印相图（含时间标签，节省图片Token）",
