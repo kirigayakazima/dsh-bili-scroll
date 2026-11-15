@@ -2005,6 +2005,16 @@ function reportMeta() {
               log(`手动轮额外挑了 ${delta} 条 ⇒ 不占今天的自动额度`)
             }
           }
+        if (why.startsWith('window:')) {
+          const winKey = `${dayKey()}:${why.replace('window:', '')}`
+          if (code === 0 || picked > 0) {
+            bumpState({ windows: { ...(st.windows || {}), [winKey]: true }, inFlightWindow: null })
+            log(`谷时巡检窗口 ${why} 成功执行并记账`)
+          } else {
+            bumpState({ inFlightWindow: null })
+            log(`谷时巡检窗口 ${why} 退出码非0或被拦截，保留窗口记账机会`)
+          }
+        }
       } catch (e) { log(`数挑了几条时出错（不影响这一轮）：${e?.message ?? e}`) }
       // ⭐ 发完评论之后**过一会儿再核一次**（2026-10-16 加的「评论发出后复核」）：
       //    接口回"发送成功"≠ 公开可见（新号/风控会进审核）；而"不公开"时连 @ 通知都不会推 ⇒
@@ -2015,11 +2025,13 @@ function reportMeta() {
     child.on('close', guardCallback(() => { if (dutyChild === child) dutyClear() }, error => log('巡检清理失败：' + String(error?.message ?? error))))
     child.on('error', guardCallback((e) => {
       releaseRunLock()
+      bumpState({ inFlightWindow: null })
       if (dutyChild === child) dutyClear()
       log(`刷B站起不来：${e?.message ?? e}`)
     }, error => log('巡检启动失败回调异常：' + String(error?.message ?? error))))
     return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile }
    } catch (e) {
+    bumpState({ inFlightWindow: null })
     if (!dutyChild) releaseRunLock()
     log(`刷B站开跑失败（${why}）：${e?.stack ?? e}`)
     return { started: false, why, error: String(e?.message ?? e) }
@@ -2036,6 +2048,7 @@ function reportMeta() {
     try {
       refreshCfg()                    // ⭐ 定时器活得比设置页久：每一跳都重新读一遍配置
       if (!cfg.peakValley) return
+      if (dutyChild) return           // 正在巡检中，不重复触发
       const now = new Date()
       const st = readJson(dutyStateFile, {})
       const today = dayKey(now)
@@ -2048,7 +2061,9 @@ function reportMeta() {
         if (!inWindow(now, WINDOWS[k])) continue
         const key = `${today}:${k}`
         if (st.windows?.[key]) continue
-        bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: k })
+        if (st.inFlightWindow === key) continue
+        // ⭐ 先记录在途标记，等真正巡检完成/有结果后再正式落盘 windows[key]，避免被静音拦截白废窗口
+        bumpState({ inFlightWindow: key, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: k })
         runDuty(`window:${k}`)
         return
       }
